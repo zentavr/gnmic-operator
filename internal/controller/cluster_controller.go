@@ -723,13 +723,33 @@ func (r *ClusterReconciler) applyConfigToPods(ctx context.Context, cluster *gnmi
 		if cluster.Spec.API != nil && cluster.Spec.API.TLS != nil && cluster.Spec.API.TLS.IssuerRef != "" {
 			scheme = "https"
 		}
-		url := fmt.Sprintf("%s://%s:%d/api/v1/config/apply", scheme, podDNS, restPort)
+		podBaseURL := fmt.Sprintf("%s://%s:%d", scheme, podDNS, restPort)
+		url := podBaseURL + "/api/v1/config/apply"
 		logger.Info("sending config to gNMIc pod", "url", url)
 		if err := r.sendApplyRequest(ctx, url, podPlan, httpClient); err != nil {
 			return 0, fmt.Errorf("failed to apply config to pod %d: %w", podIndex, err)
 		}
 
-		logger.Info("config applied to pod", "pod", podIndex, "targets", len(podPlan.Targets))
+		// tunnel-target-matches are pushed separately via
+		// /api/v1/config/tunnel-target-matches, not through the bulk
+		// /api/v1/config/apply request above: gnmic's ConfigApplyRequest.
+		// TunnelTargetMatches field has no `mapstructure` tag (only `json`),
+		// and the apply handler decodes the request body through
+		// mapstructure (not encoding/json) -- mapstructure's default
+		// field matching is case-insensitive but hyphen-blind, so the
+		// "tunnel-target-matches" JSON key never matches the
+		// TunnelTargetMatches field name and is silently dropped on every
+		// request regardless of payload content (confirmed by reading
+		// gnmic's pkg/collector/api/server/apply.go and
+		// decodeRequestMap()). The per-resource endpoint decodes the
+		// body directly into config.TunnelTargetMatch, whose own fields
+		// (type/id/config) DO have mapstructure tags and aren't
+		// hyphenated, so it works correctly.
+		if err := r.applyTunnelTargetMatches(ctx, podBaseURL, plan.TunnelTargetMatches, httpClient); err != nil {
+			return 0, fmt.Errorf("failed to apply tunnel-target-matches to pod %d: %w", podIndex, err)
+		}
+
+		logger.Info("config applied to pod", "pod", podIndex, "targets", len(podPlan.Targets), "tunnelTargetMatches", len(plan.TunnelTargetMatches))
 	}
 
 	unassigned := int32(len(distResult.UnassignedTargets))
@@ -857,6 +877,103 @@ func (r *ClusterReconciler) sendApplyRequest(ctx context.Context, url string, pl
 		return rspErr
 	}
 
+	return nil
+}
+
+// applyTunnelTargetMatches pushes each tunnel target match individually to a
+// pod's /api/v1/config/tunnel-target-matches endpoint, and deletes any
+// matches present on the pod but no longer in the desired set. See the
+// comment at the call site in applyConfigToPods for why this can't go
+// through the bulk /api/v1/config/apply request.
+func (r *ClusterReconciler) applyTunnelTargetMatches(ctx context.Context, podBaseURL string, matches map[string]*gnmic.TunnelTargetMatch, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	existingIDs, err := r.getTunnelTargetMatchIDs(ctx, podBaseURL, httpClient)
+	if err != nil {
+		return fmt.Errorf("failed to list existing tunnel-target-matches: %w", err)
+	}
+	desiredIDs := make(map[string]struct{}, len(matches))
+	for _, tm := range matches {
+		desiredIDs[tm.ID] = struct{}{}
+	}
+	for _, id := range existingIDs {
+		if _, ok := desiredIDs[id]; !ok {
+			if err := r.deleteTunnelTargetMatch(ctx, podBaseURL, id, httpClient); err != nil {
+				logger.Error(err, "failed to delete stale tunnel-target-match", "id", id)
+			}
+		}
+	}
+
+	for _, tm := range matches {
+		jsonData, err := json.Marshal(tm)
+		if err != nil {
+			return fmt.Errorf("failed to marshal tunnel target match %q: %w", tm.ID, err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, podBaseURL+"/api/v1/config/tunnel-target-matches", bytes.NewReader(jsonData))
+		if err != nil {
+			return fmt.Errorf("failed to create tunnel-target-match request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to send tunnel-target-match request: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("gNMIc pod returned non-success status %d for tunnel-target-match %q: %s", resp.StatusCode, tm.ID, string(body))
+		}
+		resp.Body.Close()
+	}
+	return nil
+}
+
+// getTunnelTargetMatchIDs lists the tunnel-target-match IDs currently known
+// to a pod (GET /api/v1/config/tunnel-target-matches returns a map keyed by
+// ID; only the keys are needed here).
+func (r *ClusterReconciler) getTunnelTargetMatchIDs(ctx context.Context, podBaseURL string, httpClient *http.Client) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, podBaseURL+"/api/v1/config/tunnel-target-matches", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("gNMIc pod returned non-success status %d: %s", resp.StatusCode, string(body))
+	}
+	var m map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return nil, fmt.Errorf("failed to decode tunnel-target-matches list: %w", err)
+	}
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// deleteTunnelTargetMatch removes a tunnel-target-match from a pod by ID.
+func (r *ClusterReconciler) deleteTunnelTargetMatch(ctx context.Context, podBaseURL, id string, httpClient *http.Client) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, podBaseURL+"/api/v1/config/tunnel-target-matches/"+id, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gNMIc pod returned non-success status %d: %s", resp.StatusCode, string(body))
+	}
 	return nil
 }
 
