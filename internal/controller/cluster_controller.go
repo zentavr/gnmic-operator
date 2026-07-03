@@ -305,14 +305,12 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// reconcile statefulset
-	statefulSet, err := r.reconcileStatefulSet(ctx, &cluster)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	logger.Info("reconciled cluster statefulset", "replicas", ptr.Deref(statefulSet.Spec.Replicas, 0), "image", statefulSet.Spec.Template.Spec.Containers[0].Image)
-
+	// Collect pipeline data and build the apply plan BEFORE reconciling the
+	// StatefulSet/ConfigMap: buildConfigContent() needs applyPlan.TunnelTargetMatches
+	// to render tunnel-server.targets, and there's no other place to get it from.
+	// gnmic has no runtime API for this (no /config/apply or tunnel-related route
+	// exists in its REST API), so the static config.yaml is the only path.
+	//
 	// retrieve enabled pipelines referencing this cluster
 	pipelines, err := r.listPipelinesForCluster(ctx, &cluster)
 	if err != nil {
@@ -485,6 +483,14 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r.m.Lock()
 	r.plans[cluster.Namespace+"/"+cluster.Name] = applyPlan
 	r.m.Unlock()
+
+	// reconcile statefulset (needs applyPlan.TunnelTargetMatches for tunnel-server.targets)
+	statefulSet, err := r.reconcileStatefulSet(ctx, &cluster, applyPlan.TunnelTargetMatches)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("reconciled cluster statefulset", "replicas", ptr.Deref(statefulSet.Spec.Replicas, 0), "image", statefulSet.Spec.Template.Spec.Containers[0].Image)
 
 	// reconcile Prometheus output services
 	if err := r.reconcilePrometheusServices(ctx, &cluster, pipelineDataMap, applyPlan.PrometheusPorts); err != nil {
@@ -1140,8 +1146,8 @@ func pipelineReferencesResource(pipeline *gnmicv1alpha1.Pipeline, resourceName s
 	return false
 }
 
-func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *gnmicv1alpha1.Cluster) (*appsv1.StatefulSet, error) {
-	desired, desiredConfigMap, err := r.buildStatefulSet(cluster)
+func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *gnmicv1alpha1.Cluster, tunnelTargetMatches map[string]*gnmic.TunnelTargetMatch) (*appsv1.StatefulSet, error) {
+	desired, desiredConfigMap, err := r.buildStatefulSet(cluster, tunnelTargetMatches)
 	if err != nil {
 		return nil, err
 	}
@@ -1931,11 +1937,11 @@ func (r *ClusterReconciler) cleanupControllerCA(ctx context.Context, cluster *gn
 	return client.IgnoreNotFound(r.Delete(ctx, cm))
 }
 
-func (r *ClusterReconciler) buildConfigMap(cluster *gnmicv1alpha1.Cluster) (*corev1.ConfigMap, error) {
+func (r *ClusterReconciler) buildConfigMap(cluster *gnmicv1alpha1.Cluster, tunnelTargetMatches map[string]*gnmic.TunnelTargetMatch) (*corev1.ConfigMap, error) {
 	configMapName := fmt.Sprintf("%s%s-config", resourcePrefix, cluster.Name)
 
 	// build base config content
-	content, err := r.buildConfigContent(cluster)
+	content, err := r.buildConfigContent(cluster, tunnelTargetMatches)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build config content: %w", err)
 	}
@@ -2124,8 +2130,12 @@ func (r *ClusterReconciler) listPipelinesForCluster(ctx context.Context, cluster
 	return result, nil
 }
 
-// buildConfigContent builds the gnmic configuration from the cluster and its pipelines
-func (r *ClusterReconciler) buildConfigContent(cluster *gnmicv1alpha1.Cluster) ([]byte, error) {
+// buildConfigContent builds the gnmic configuration from the cluster and its pipelines.
+// tunnelTargetMatches is the set of resolved TunnelTargetPolicy match rules (keyed by
+// "namespace/policyName") computed by the plan builder; gnmic has no runtime API for
+// tunnel-server.targets (confirmed: no /config/apply or tunnel-related route exists in
+// gnmic's REST API), so this is the only way these rules can ever reach a running pod.
+func (r *ClusterReconciler) buildConfigContent(cluster *gnmicv1alpha1.Cluster, tunnelTargetMatches map[string]*gnmic.TunnelTargetMatch) ([]byte, error) {
 	restPort := int32(defaultRestPort)
 	if cluster.Spec.API != nil && cluster.Spec.API.RestPort != 0 {
 		restPort = cluster.Spec.API.RestPort
@@ -2152,6 +2162,23 @@ func (r *ClusterReconciler) buildConfigContent(cluster *gnmicv1alpha1.Cluster) (
 		tunnelTLSConfig := gnmic.TunnelServerTLSConfig(cluster)
 		if tunnelTLSConfig != nil {
 			tunnelConfig["tls"] = tunnelTLSConfig
+		}
+
+		if len(tunnelTargetMatches) > 0 {
+			keys := make([]string, 0, len(tunnelTargetMatches))
+			for k := range tunnelTargetMatches {
+				keys = append(keys, k)
+			}
+			// sort by policy key for deterministic config output across reconciles
+			// (map iteration order is random, and an unstable ordering here would
+			// cause the ConfigMap to appear "changed" and trigger a rollout on
+			// every reconcile even when nothing actually changed).
+			sort.Strings(keys)
+			targets := make([]*gnmic.TunnelTargetMatch, 0, len(keys))
+			for _, k := range keys {
+				targets = append(targets, tunnelTargetMatches[k])
+			}
+			tunnelConfig["targets"] = targets
 		}
 
 		config["tunnel-server"] = tunnelConfig
@@ -2591,9 +2618,9 @@ func (r *ClusterReconciler) resolveTunnelTargetPolicies(ctx context.Context, pip
 	return result, nil
 }
 
-func (r *ClusterReconciler) buildStatefulSet(cluster *gnmicv1alpha1.Cluster) (*appsv1.StatefulSet, *corev1.ConfigMap, error) {
+func (r *ClusterReconciler) buildStatefulSet(cluster *gnmicv1alpha1.Cluster, tunnelTargetMatches map[string]*gnmic.TunnelTargetMatch) (*appsv1.StatefulSet, *corev1.ConfigMap, error) {
 	// build gNMIc pod base configuration
-	configMap, err := r.buildConfigMap(cluster)
+	configMap, err := r.buildConfigMap(cluster, tunnelTargetMatches)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build config map: %w", err)
 	}
