@@ -59,6 +59,7 @@ import (
 	gnmicv1alpha1 "github.com/gnmic/operator/api/v1alpha1"
 	"github.com/gnmic/operator/internal/gnmic"
 	"github.com/gnmic/operator/internal/utils"
+	gapi "github.com/openconfig/gnmic/pkg/api/types"
 )
 
 // ClusterReconciler reconciles a Cluster object
@@ -713,7 +714,23 @@ func (r *ClusterReconciler) applyConfigToPods(ctx context.Context, cluster *gnmi
 		// distribute targets for this pod
 		podPlan, ok := distResult.PerPodPlans[podIndex]
 		if !ok {
-			continue
+			// DistributeTargets/boundedLoadRendezvousHash returns a
+			// completely empty PerPodPlans map when there are zero static
+			// Targets to distribute (tunnel-only deployments have none) --
+			// `continue`-ing here used to skip sendApplyRequest and
+			// applyTunnelTargetMatches for every single pod, every single
+			// reconcile, silently. Subscriptions/outputs/processors/
+			// tunnel-target-matches apply to every pod regardless of
+			// static target distribution, so build the same fallback shape
+			// DistributeTargets would have, just with no targets assigned.
+			podPlan = &gnmic.ApplyPlan{
+				Targets:             make(map[string]*gapi.TargetConfig),
+				Subscriptions:       plan.Subscriptions,
+				Outputs:             plan.Outputs,
+				Inputs:              plan.Inputs,
+				Processors:          plan.Processors,
+				TunnelTargetMatches: plan.TunnelTargetMatches,
+			}
 		}
 		// build the URL for this pod
 		// statefulSet pods have predictable DNS names:
@@ -3486,7 +3503,9 @@ type listenPortAndPath struct {
 
 // parseListenPortAndPath parses the "listen" and "path" fields from output config and returns the port and path.
 // supports formats: "listen: ":9804", "0.0.0.0:9804", "localhost:9804", "[::1]:9804", "[2001:db8::8a2e:370:7334]:9804".
-// returns the default port 9804 if not specified.
+// returns port 0 if "listen" is not specified, so the caller can fall back to
+// the port actually assigned to gnmic by assignPrometheusOutputPorts instead
+// of a fabricated default that could disagree with it.
 // returns the default path /metrics if not specified.
 func parseListenPortAndPath(configRaw []byte) (int32, string, error) {
 	if configRaw == nil {
@@ -3498,13 +3517,14 @@ func parseListenPortAndPath(configRaw []byte) (int32, string, error) {
 		return 0, "", err
 	}
 
-	config.Listen = strings.TrimSpace(config.Listen)
-	if config.Listen == "" {
-		config.Listen = fmt.Sprintf(":%d", gnmic.PrometheusDefaultPort)
-	}
 	config.Path = strings.TrimSpace(config.Path)
 	if config.Path == "" {
 		config.Path = gnmic.PrometheusDefaultPath
+	}
+
+	config.Listen = strings.TrimSpace(config.Listen)
+	if config.Listen == "" {
+		return 0, config.Path, nil
 	}
 
 	// parse the port from the listen string value
